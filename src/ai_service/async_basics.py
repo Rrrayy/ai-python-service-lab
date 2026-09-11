@@ -1,5 +1,8 @@
 import asyncio
 import time
+import random
+
+from numpy.random import exponential
 
 
 class RetryableModelError(Exception):
@@ -80,22 +83,53 @@ async def mock_model_call_with_error(request_id:int)->str:
 		raise NonRetryableModelError("请求参数格式错误")
 	return f"请求{request_id}完成"
 
+def calculate_backoff(retry_index:int,base_delay:float=0.5,max_delay:float=8.0)->float:
+	exponential_delay=base_delay * (2 ** retry_index)
+	capped_delay=min(exponential_delay,max_delay)
+	return random.uniform(0,capped_delay)
 
 async def call_with_selective_retry(request_id:int,max_retries:int)->str:
 	# 只对暂时性模型错误执行有限重试。
 	attempt=0
-	while attempt<=max_retries:
+	retry_index=0
+	while attempt<max_retries:
 		try:
 			attempt+=1
 			return await mock_model_call_with_error(request_id)
 		except RetryableModelError:
-			if attempt<=max_retries:
-				continue
-			raise
+			if attempt>max_retries:
+				raise
+			delay_seconds=calculate_backoff(retry_index)
+			print(f"第{attempt}次调用失败,等待{delay_seconds:1f}秒后重试")
+			await asyncio.sleep(delay_seconds)
+			retry_index+=1
 		except NonRetryableModelError:
 			raise
 		except Exception:
 			raise
+
+async def slow_model_call(request_id:int)->str:
+	print(f"请求{request_id}开始")
+	try:
+		await asyncio.sleep(3)
+		print(f"请求{request_id}正常完成")
+		return f"请求{request_id}完成"
+	finally:
+		print(f"请求{request_id}结束清理")
+
+async def call_with_timeout(request_id:int,timeout_seconds:float)->str:
+	#最多等待指定时间
+	return await asyncio.wait_for(
+		slow_model_call(request_id),
+		timeout=timeout_seconds
+	)
+async def test_timeout()->None:
+	try:
+		result=await call_with_timeout(1,2)
+		print(result)
+	except asyncio.TimeoutError:
+		print("外层捕获：模型请求超时")
+
 
 
 async def run_current_experiments()->None:
@@ -125,7 +159,14 @@ async def run_current_experiments()->None:
 		await call_with_selective_retry(3,2)
 	except NonRetryableModelError as error:
 		print(f"永久性错误立即失败：{error}")
+	try:
+		timeout_result=await call_with_timeout(1,2)
+		print(f"超时测试结果:{timeout_result}")
+	except asyncio.TimeoutError:
+		print("超时测试：模型请求超时")
 
 
+	await call_with_selective_retry(2, 2)
 if __name__=="__main__":
 	asyncio.run(run_current_experiments())
+	#asyncio.run(test_timeout())
