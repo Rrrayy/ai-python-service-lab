@@ -1,9 +1,22 @@
 import asyncio
 import time
 import random
+from enum import Enum
+from dataclasses import dataclass
 
-from numpy.random import exponential
+class TaskStatus(Enum):
+	CREATED="created"
+	QUEUED="queued"
+	RUNNING="running"
+	COMPLETED="completed"
+	FAILED="failed"
+	CANCELLED="cancelled"
 
+@dataclass
+class TaskRecord:
+	task_id:int
+	status:TaskStatus=TaskStatus.CREATED
+	error:str|None=None
 
 class RetryableModelError(Exception):
 	# 暂时性模型错误允许重试。
@@ -14,6 +27,26 @@ class NonRetryableModelError(Exception):
 	# 永久性模型错误不应重试。
 	pass
 
+
+ALLOWED_TRANSITIONS={
+	TaskStatus.CREATED:{TaskStatus.QUEUED,TaskStatus.CANCELLED},
+	TaskStatus.QUEUED:{TaskStatus.RUNNING,TaskStatus.CANCELLED},
+	TaskStatus.RUNNING:{
+		TaskStatus.COMPLETED,
+		TaskStatus.FAILED,
+		TaskStatus.CANCELLED
+	},
+	TaskStatus.COMPLETED:set(),
+	TaskStatus.FAILED:set(),
+TaskStatus.CANCELLED:set()
+}
+
+def update_task_status(task:TaskRecord,new_status:TaskStatus,error:str|None=None)->None:
+	if new_status not in ALLOWED_TRANSITIONS[task.status]:
+		raise ValueError(f"非法状态转移：{task.status.value}->{new_status.value}")
+	task.status=new_status
+	if new_status==TaskStatus.FAILED:
+		task.error=error
 
 async def mock_model_call(request_id:int)->str:
 	# 模拟模型网络等待。
@@ -92,7 +125,7 @@ async def call_with_selective_retry(request_id:int,max_retries:int)->str:
 	# 只对暂时性模型错误执行有限重试。
 	attempt=0
 	retry_index=0
-	while attempt<max_retries:
+	while attempt<=max_retries:
 		try:
 			attempt+=1
 			return await mock_model_call_with_error(request_id)
@@ -219,10 +252,12 @@ async def submit_request(queue:asyncio.Queue[int],request_id:int)->bool:
 		print(f"请求{request_id}被拒绝:队列已满")
 		return False
 
-async def consume_requests(queue:asyncio.Queue[int],semaphore:asyncio.Semaphore)->None:
+async def consume_requests(queue:asyncio.Queue[int|None],semaphore:asyncio.Semaphore)->None:
 	while True:
 		request_id=await queue.get()
 		try:
+			if request_id is None:
+				return
 			async with semaphore:
 				print(f"请求{request_id}开始执行")
 				await asyncio.sleep(1)
@@ -248,9 +283,21 @@ async def test_queue_limit()->None:
 
 	print("所有消费者任务已取消")
 
+async def graceful_shutdown_experiment()->None:
+	queue=asyncio.Queue(3)
+	semaphore=asyncio.Semaphore(2)
+	consumer_tasks=[asyncio.create_task(consume_requests(queue,semaphore)) for _ in range(2)]
+	for request_id in range(1,4):
+		await  submit_request(queue,request_id)
+	await queue.join()
+	for _ in consumer_tasks:
+		await  queue.put(None)
+
+	await asyncio.gather(*consumer_tasks)
+	print("所有消费者已优雅关闭")
+
 
 async def run_current_experiments()->None:
-	# 执行批量并发实验。
 	request_ids=[1,2,3]
 	start_time=time.perf_counter()
 	results=await run_batch(request_ids)
@@ -262,11 +309,9 @@ async def run_current_experiments()->None:
 	print(f"失败请求ID：{failed_request_ids}")
 	print(f"批量调用耗时：{elapsed_time:.2f}秒")
 
-	# 执行普通有限重试实验。
 	attempt_counts.clear()
 	print(f"普通重试结果：{await call_with_retry(2,2)}")
 
-	# 执行选择性重试实验。
 	print(f"选择性重试成功：{await call_with_selective_retry(1,2)}")
 	try:
 		await call_with_selective_retry(2,2)
@@ -283,13 +328,26 @@ async def run_current_experiments()->None:
 		print("超时测试：模型请求超时")
 
 
-	await call_with_selective_retry(2, 2)
 if __name__=="__main__":
-	#asyncio.run(run_current_experiments())
-	#asyncio.run(test_timeout())
-	# results = asyncio.run(run_limited_batch([1, 2, 3, 4, 5], 2))
-	# print(results)
-	#asyncio.run(compare_concurrency())
-	#asyncio.run(test_cancellation())
-	#asyncio.run(test_batch_cancellation())
-	asyncio.run(test_queue_limit())
+	task = TaskRecord(task_id=1)
+	update_task_status(task, TaskStatus.QUEUED)
+	update_task_status(task, TaskStatus.RUNNING)
+	update_task_status(task, TaskStatus.COMPLETED)
+	print(task.status.value)
+	try:
+		update_task_status(task, TaskStatus.RUNNING)
+	except ValueError as error:
+		print(error)
+
+	failed_task = TaskRecord(task_id=2)
+
+	update_task_status(failed_task, TaskStatus.QUEUED)
+	update_task_status(failed_task, TaskStatus.RUNNING)
+	update_task_status(
+		failed_task,
+		TaskStatus.FAILED,
+		"模型调用超时"
+	)
+
+	print(failed_task.status.value)
+	print(failed_task.error)
