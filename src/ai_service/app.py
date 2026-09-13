@@ -1,4 +1,5 @@
 import asyncio
+import time
 
 from fastapi import Depends,FastAPI,Request
 from fastapi.exceptions import RequestValidationError
@@ -37,6 +38,22 @@ class ApiError(Exception):
 
 app=FastAPI()
 
+@app.middleware("http")
+async def measure_request(request:Request,call_next):
+	start_time=time.perf_counter()
+	response=None
+	try:
+		response=await call_next(request)
+		return response
+	finally:
+		elapsed_ms=(time.perf_counter()-start_time)*1000
+		status_code=response.status_code if response is not None else 500
+		if response is not None:
+			response.headers["X-Process-Time"]=f"{elapsed_ms:.2f}"
+		print(
+			f"{request.method} {request.url.path} "
+			f"{status_code} {elapsed_ms:.2f}ms"
+		)
 
 def get_model_name()->str:
 	return DEFAULT_MODEL
