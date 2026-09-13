@@ -1,5 +1,8 @@
 import asyncio
 import time
+import uuid
+import re
+import json
 
 from fastapi import Depends,FastAPI,Request
 from fastapi.exceptions import RequestValidationError
@@ -35,11 +38,33 @@ class ApiError(Exception):
 		self.code=code
 		self.message=message
 
+request_id_pattern=re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+def new_request_id()->str:
+	return uuid.uuid4().hex
+
+def resolve_request_id(request:Request)->str:
+	client_request_id=request.headers.get("X-Request-ID")
+	if client_request_id is not None and request_id_pattern.fullmatch(client_request_id):
+		return client_request_id
+	return new_request_id()
+
+def resolve_trace_id(request:Request,request_id:str)->str:
+	client_trace_id=request.headers.get("X-Trace-ID")
+	if client_trace_id is not None and request_id_pattern.fullmatch(client_trace_id):
+		return client_trace_id
+	return request_id
+
+def get_request_id(request:Request)->str:
+	return request.state.request_id
 
 app=FastAPI()
 
 @app.middleware("http")
-async def measure_request(request:Request,call_next):
+async def track_request(request:Request,call_next):
+	request_id=resolve_request_id(request)
+	trace_id=resolve_trace_id(request,request_id)
+	request.state.request_id=request_id
+	request.state.trace_id=trace_id
 	start_time=time.perf_counter()
 	response=None
 	try:
@@ -50,10 +75,17 @@ async def measure_request(request:Request,call_next):
 		status_code=response.status_code if response is not None else 500
 		if response is not None:
 			response.headers["X-Process-Time"]=f"{elapsed_ms:.2f}"
-		print(
-			f"{request.method} {request.url.path} "
-			f"{status_code} {elapsed_ms:.2f}ms"
-		)
+			response.headers["X-Request-ID"]=request_id
+			response.headers["X-Trace-ID"]=trace_id
+		access_log={
+			"request_id":request_id,
+			"trace_id":trace_id,
+			"method":request.method,
+			"path":request.url.path,
+			"status_code":status_code,
+			"elapsed_ms":round(elapsed_ms,2)
+		}
+		print(json.dumps(access_log,ensure_ascii=False))
 
 def get_model_name()->str:
 	return DEFAULT_MODEL
@@ -142,3 +174,7 @@ async def debug_timeout():
 		return {"content":result}
 	except asyncio.TimeoutError as error:
 		raise ApiError(504,"MODEL_TIMEOUT","模型调用超时") from error
+
+@app.get("/debug/request-id")
+async def debug_request_id(request_id:str=Depends(get_request_id)):
+	return{"request_id":request_id }
