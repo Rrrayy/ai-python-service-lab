@@ -1,14 +1,15 @@
 import asyncio
+import json
+import re
 import time
 import uuid
-import re
-import json
+from contextlib import asynccontextmanager
 
+import httpx
 from fastapi import Depends,FastAPI,Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel,Field
-
 
 DEFAULT_MODEL="mock_model"
 
@@ -38,26 +39,40 @@ class ApiError(Exception):
 		self.code=code
 		self.message=message
 
-request_id_pattern=re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+REQUEST_ID_PATTERN=re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
 def new_request_id()->str:
 	return uuid.uuid4().hex
 
 def resolve_request_id(request:Request)->str:
 	client_request_id=request.headers.get("X-Request-ID")
-	if client_request_id is not None and request_id_pattern.fullmatch(client_request_id):
+	if client_request_id is not None and REQUEST_ID_PATTERN.fullmatch(client_request_id):
 		return client_request_id
 	return new_request_id()
 
 def resolve_trace_id(request:Request,request_id:str)->str:
 	client_trace_id=request.headers.get("X-Trace-ID")
-	if client_trace_id is not None and request_id_pattern.fullmatch(client_trace_id):
+	if client_trace_id is not None and REQUEST_ID_PATTERN.fullmatch(client_trace_id):
 		return client_trace_id
 	return request_id
 
 def get_request_id(request:Request)->str:
 	return request.state.request_id
 
-app=FastAPI()
+def get_model_client(request:Request)->httpx.AsyncClient:
+	return request.app.state.model_client
+
+@asynccontextmanager
+async def lifespan(app:FastAPI):
+	app.state.model_client=httpx.AsyncClient(timeout=10.0)
+	print("服务启动：模型客户端已创建")
+	try:
+		yield
+	finally:
+		await app.state.model_client.aclose()
+		print("服务关闭：模型客户端已释放")
+
+app=FastAPI(lifespan=lifespan)
 
 @app.middleware("http")
 async def track_request(request:Request,call_next):
@@ -177,4 +192,11 @@ async def debug_timeout():
 
 @app.get("/debug/request-id")
 async def debug_request_id(request_id:str=Depends(get_request_id)):
-	return{"request_id":request_id }
+	return {"request_id":request_id}
+
+@app.get("/debug/model-client")
+async def debug_model_client(model_client:httpx.AsyncClient=Depends(get_model_client)):
+	return {
+		"client_id":id(model_client),
+		"is_closed":model_client.is_closed
+	}
