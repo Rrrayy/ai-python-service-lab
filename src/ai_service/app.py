@@ -11,7 +11,10 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel,Field
 
-DEFAULT_MODEL="mock_model"
+from .config import Settings,validate_settings
+from .providers import ModelProvider,ModelProviderError,ModelUpstreamError,create_provider
+
+DEFAULT_MODEL="mock-model"
 
 
 class ChatMessage(BaseModel):
@@ -59,17 +62,33 @@ def resolve_trace_id(request:Request,request_id:str)->str:
 def get_request_id(request:Request)->str:
 	return request.state.request_id
 
+def get_settings(request:Request)->Settings:
+	return request.app.state.settings
+
 def get_model_client(request:Request)->httpx.AsyncClient:
 	return request.app.state.model_client
 
+def get_provider(request:Request)->ModelProvider:
+	return request.app.state.provider
+
 @asynccontextmanager
 async def lifespan(app:FastAPI):
-	app.state.model_client=httpx.AsyncClient(timeout=10.0)
-	print("服务启动：模型客户端已创建")
+	settings=Settings()
+	validate_settings(settings)
+	model_client=httpx.AsyncClient(timeout=settings.timeout)
 	try:
+		provider=create_provider(settings.provider,settings,model_client)
+		app.state.settings=settings
+		app.state.provider=provider
+		app.state.model_client=model_client
+		print(
+			f"服务启动：provider={settings.provider},"
+			f"model={settings.model_name},"
+			f"has_api_key={settings.api_key is not None}"
+		)
 		yield
 	finally:
-		await app.state.model_client.aclose()
+		await model_client.aclose()
 		print("服务关闭：模型客户端已释放")
 
 app=FastAPI(lifespan=lifespan)
@@ -135,6 +154,32 @@ async def handle_validation_error(request:Request,error:RequestValidationError):
 		}
 	)
 
+@app.exception_handler(ModelUpstreamError)
+async def handle_model_upstream_error(
+	request:Request,
+	error:ModelUpstreamError
+):
+	return JSONResponse(
+		status_code=502,
+		content={
+			"code":"MODEL_UPSTREAM_ERROR",
+			"message":str(error)
+		}
+	)
+
+
+@app.exception_handler(ModelProviderError)
+async def handle_model_provider_error(
+	request:Request,
+	error:ModelProviderError
+):
+	return JSONResponse(
+		status_code=500,
+		content={
+			"code":"MODEL_PROVIDER_ERROR",
+			"message":str(error)
+		}
+	)
 
 @app.get("/health")
 async def health():
@@ -158,10 +203,17 @@ async def get_user(user_id:int):
 
 
 @app.post("/v1/chat/completions",response_model=ChatResponse)
-async def chat(request:ChatRequest):
+async def chat(request:ChatRequest,provider:ModelProvider=Depends(get_provider)):
+	if not provider.supports(request.model):
+		raise ApiError(400,"MODEL_NOT_SUPPORTED",f"当前 Provider 不支持模型：{request.model}")
+	content=await provider.chat(
+		request.model,
+		[message.model_dump() for message in request.messages],
+		request.temperature
+	)
 	return ChatResponse(
 		model=request.model,
-		content=f"收到{len(request.messages)}条消息"
+		content=content
 	)
 
 
