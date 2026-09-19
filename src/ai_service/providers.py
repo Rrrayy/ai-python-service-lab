@@ -1,8 +1,34 @@
 import httpx
 import json
 from typing import Any,Literal
-from pydantic import BaseModel,ConfigDict,Field
+from pydantic import BaseModel,ConfigDict,Field,ValidationError
 from abc import ABC,abstractmethod
+
+
+class ProviderError(Exception):
+	pass
+
+
+class ProviderTimeoutError(ProviderError):
+	pass
+
+
+class ProviderAuthenticationError(ProviderError):
+	pass
+
+
+class ProviderRateLimitError(ProviderError):
+	pass
+
+
+class ProviderUpstreamError(ProviderError):
+	pass
+
+
+class ProviderProtocolError(ProviderError):
+	pass
+
+
 
 class Message(BaseModel):
 	model_config = ConfigDict(extra="forbid")
@@ -115,66 +141,38 @@ class OpenAICompatibleProvider(ModelProvider):
 	# 		"total_tokens": 15
 	# 	}
 	# }
-	def parse_response(self,data:dict[str,Any])->ModelResponse:
-		choices=data.get("choices")
-		if not isinstance(choices,list) or not choices:
-			raise ValueError("模型响应缺少choices")
-
-		choice=choices[0]
-		if not isinstance(choice,dict):
-			raise ValueError("模型响应choice格式错误")
-
-		message=choice.get("message")
-		if not isinstance(message,dict):
-			raise ValueError("模型响应缺少message")
-
-		usage_data=data.get("usage")
-		usage=None
-		if isinstance(usage_data,dict):
-			usage=TokenUsage.model_validate(usage_data)
-
-		tool_calls_data = message.get("tool_calls", [])
-		tool_calls = self.parse_tool_calls(tool_calls_data)
-
-		return ModelResponse(
-			content=message.get("content"),
-			tool_calls=tool_calls,
-			finish_reason=choice.get("finish_reason"),
-			usage=usage
-		)
-
 	def parse_tool_calls(self, data: Any) -> list[ToolCall]:
 		if not isinstance(data, list):
-			raise ValueError("tool_calls格式错误")
+			raise ProviderProtocolError("tool_calls格式错误")
 
 		tool_calls = []
 		for item in data:
 			if not isinstance(item, dict):
-				raise ValueError("工具调用格式错误")
+				raise ProviderProtocolError("工具调用格式错误")
 
 			call_id = item.get("id")
 			if not isinstance(call_id, str) or not call_id:
-				raise ValueError("工具调用id缺失")
+				raise ProviderProtocolError("工具调用id缺失")
 
 			function_data = item.get("function")
 			if not isinstance(function_data, dict):
-				raise ValueError("工具function格式错误")
+				raise ProviderProtocolError("工具function格式错误")
 
 			name = function_data.get("name")
 			if not isinstance(name, str) or not name:
-				raise ValueError("工具名称缺失")
+				raise ProviderProtocolError("工具名称缺失")
 
 			arguments_text = function_data.get("arguments")
 			if not isinstance(arguments_text, str):
-				raise ValueError("工具arguments必须是JSON字符串")
+				raise ProviderProtocolError("工具arguments必须是JSON字符串")
 
 			try:
 				arguments = json.loads(arguments_text)
 			except json.JSONDecodeError as error:
-				raise ValueError("工具arguments不是合法JSON") from error
+				raise ProviderProtocolError("工具arguments不是合法JSON") from error
 
 			if not isinstance(arguments, dict):
-				raise ValueError("工具arguments必须是对象")
+				raise ProviderProtocolError("工具arguments必须是对象")
 
 			tool_calls.append(
 				ToolCall(
@@ -186,6 +184,45 @@ class OpenAICompatibleProvider(ModelProvider):
 
 		return tool_calls
 
+	def parse_response(self, data: dict[str, Any]) -> ModelResponse:
+		if not isinstance(data, dict):
+			raise ProviderProtocolError("模型响应必须是JSON对象")
+
+		choices = data.get("choices")
+		if not isinstance(choices, list) or not choices:
+			raise ProviderProtocolError("模型响应缺少choices")
+
+		choice = choices[0]
+		if not isinstance(choice, dict):
+			raise ProviderProtocolError("模型响应choice格式错误")
+
+		message = choice.get("message")
+		if not isinstance(message, dict):
+			raise ProviderProtocolError("模型响应缺少message")
+
+		usage_data = data.get("usage")
+		usage = None
+		if usage_data is not None:
+			if not isinstance(usage_data, dict):
+				raise ProviderProtocolError("模型响应usage格式错误")
+
+			try:
+				usage = TokenUsage.model_validate(usage_data)
+			except ValidationError as error:
+				raise ProviderProtocolError("模型响应usage字段不合法") from error
+
+		tool_calls = self.parse_tool_calls(message.get("tool_calls", []))
+
+		try:
+			return ModelResponse(
+				content=message.get("content"),
+				tool_calls=tool_calls,
+				finish_reason=choice.get("finish_reason"),
+				usage=usage
+			)
+		except ValidationError as error:
+			raise ProviderProtocolError("模型响应字段不合法") from error
+
 	async def chat(self, request: ModelRequest) -> ModelResponse:
 		payload = self.build_payload(request)
 		url = f"{self.base_url}/v1/chat/completions"
@@ -193,75 +230,34 @@ class OpenAICompatibleProvider(ModelProvider):
 			"Authorization": f"Bearer {self.api_key}",
 			"Content-Type": "application/json"
 		}
-		response = await self.http_client.post(
-			url,
-			headers=headers,
-			json=payload
-		)
-		response.raise_for_status()
-		return self.parse_response(response.json())
 
+		try:
+			response = await self.http_client.post(
+				url,
+				headers=headers,
+				json=payload
+			)
+		except httpx.TimeoutException as error:
+			raise ProviderTimeoutError("模型请求超时") from error
+		except httpx.RequestError as error:
+			raise ProviderUpstreamError("模型网络请求失败") from error
 
-async def main()->None:
+		try:
+			response.raise_for_status()
+		except httpx.HTTPStatusError as error:
+			status_code = error.response.status_code
+			if status_code in {401, 403}:
+				raise ProviderAuthenticationError("模型认证失败") from error
+			if status_code == 429:
+				raise ProviderRateLimitError("模型请求受到限流") from error
+			raise ProviderUpstreamError(
+				f"模型上游返回HTTP {status_code}"
+			) from error
 
-	async def mock_handler(request:httpx.Request)->httpx.Response:
-		print(request.method)
-		print(request.url)
-		print(request.headers["authorization"])
-		payload = json.loads(request.content.decode("utf-8"))
-		print(payload)
-		return httpx.Response(
-			200,
-			json={
-				"choices":[
-					{
-						"message":{
-							"role":"assistant",
-							"content":None,
-							"tool_calls":[
-								{
-									"id":"call_progress_001",
-									"type":"function",
-									"function":{
-										"name":"get_user_progress",
-										"arguments":"{\"user_id\":1}"
-									}
-								}
-							]
-						},
-						"finish_reason":"tool_calls"
-					}
-				],
-				"usage":{
-					"prompt_tokens":10,
-					"completion_tokens":5,
-					"total_tokens":15
-				}
-			}
-		)
+		try:
+			response_data = response.json()
+		except (json.JSONDecodeError, ValueError) as error:
+			raise ProviderProtocolError("模型响应不是合法JSON") from error
 
-	transport=httpx.MockTransport(mock_handler)
+		return self.parse_response(response_data)
 
-	async with httpx.AsyncClient(transport=transport) as http_client:
-		provider=OpenAICompatibleProvider(
-			base_url="https://example.com",
-			api_key="test-key",
-			http_client=http_client
-		)
-		request=ModelRequest(
-			model="mock-model",
-			messages=[
-				Message(
-					role="user",
-					content="你好"
-				)
-			],
-			temperature=0.7
-		)
-		response=await provider.chat(request)
-		print(response.model_dump())
-
-
-if __name__=="__main__":
-	import asyncio
-	asyncio.run(main())
