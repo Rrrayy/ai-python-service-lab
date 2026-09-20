@@ -1,47 +1,42 @@
 import json
 
+from .providers import Message,ModelProvider,ModelRequest,ModelResponse,ToolCall
 from .tools import execute_tool_calls,tool_registry
 from collections import  Counter
 
-class ScriptedProvider:
+class ScriptedProvider(ModelProvider):
 	def __init__(self)->None:
 		self.call_count=0
 
-	async def chat(self,messages:list[dict])->dict:
+	async def chat(self,request:ModelRequest)->ModelResponse:
 		self.call_count+=1
 
 		if self.call_count == 1:
-			return {
-				"content": None,
-				"tool_calls": [
-					{
-						"id": "call_progress_001",
-						"type": "function",
-						"function": {
-							"name": "get_user_progress",
-							"arguments": '{"user_id":1}'
-						}
-					},
-					{
-						"id": "call_progress_002",
-						"type": "function",
-						"function": {
-							"name": "get_user_progress",
-							"arguments": '{"user_id":2}'
-						}
-					}
+			return ModelResponse(
+				content=None,
+				tool_calls=[
+					ToolCall(
+						id="call_progress_001",
+						name="get_user_progress",
+						arguments={"user_id": 1}
+					),
+					ToolCall(
+						id="call_progress_002",
+						name="get_user_progress",
+						arguments={"user_id": 2}
+					)
 				],
-				"finish_reason": "tool_calls"
-			}
+				finish_reason="tool_calls"
+			)
 
 		if self.call_count==2:
 			has_progress_call = any(
-				message["role"] == "assistant"
+				message.role== "assistant"
 				and any(
 					tool_call["id"] == "call_progress_001"
-					for tool_call in message.get("tool_calls",[])
+					for tool_call in message.tool_calls
 				)
-				for message in messages
+				for message in request.messages
 			)
 
 			expected_ids = {
@@ -50,9 +45,9 @@ class ScriptedProvider:
 			}
 
 			returned_ids = {
-				message["tool_call_id"]
-				for message in messages
-				if message["role"] == "tool"
+				message.tool_call_id
+				for message in request.messages
+				if message.role == "tool"
 			}
 			if not has_progress_call:
 				raise RuntimeError("第二次模型调用前缺少 assistant 工具调用记录")
@@ -60,18 +55,41 @@ class ScriptedProvider:
 			if not expected_ids.issubset(returned_ids):
 				raise RuntimeError("第二次模型调用前缺少学习进度工具结果")
 
-
-
-			return {
-				"content": "已分别查询用户 1 和用户 2 的 Agent 学习进度。",
-				"tool_calls": [],
-				"finish_reason": "stop"
-			}
+			return ModelResponse(
+				content="已分别查询用户 1 和用户 2 的 Agent 学习进度。",
+				finish_reason="stop"
+			)
 
 		raise RuntimeError("Mock Provider 收到了超出预期的模型调用")
 
-def validate_tool_results(tool_calls:list[dict],tool_results:list[dict])->None:
-	requested_ids=[tool_call["id"] for tool_call in tool_calls]
+def build_model_request(messages:list[dict])->ModelRequest:
+	converted_messages=[]
+
+	for message in messages:
+		message_data=dict(message)
+		tool_calls=message_data.get("tool_calls")
+
+		if tool_calls:
+			message_data["tool_calls"]=[
+				tool_call.model_dump()
+				if isinstance(tool_call,ToolCall)
+				else tool_call
+				for tool_call in tool_calls
+			]
+
+		converted_messages.append(
+			Message.model_validate(message_data)
+		)
+
+	return ModelRequest(
+		model="mock-model",
+		messages=converted_messages,
+		temperature=0.7,
+		stream=False
+	)
+
+def validate_tool_results(tool_calls:list[ToolCall],tool_results:list[dict])->None:
+	requested_ids=[tool_call.id for tool_call in tool_calls]
 	result_ids=[tool_result["tool_call_id"] for tool_result in tool_results]
 
 	requested_counts=Counter(requested_ids)
@@ -85,8 +103,15 @@ def validate_tool_results(tool_calls:list[dict],tool_results:list[dict])->None:
 		unexpected_ids=list((result_counts-requested_counts).elements())
 		raise RuntimeError(f"工具结果与调用不匹配，缺少={missing_ids}，多出={unexpected_ids}")
 
+def serialize_message(message:dict)->dict:
+	serialized=dict(message)
+	tool_calls=serialized.get("tool_calls")
+	if tool_calls:
+		serialized["tool_calls"]=[tool_call.model_dump() for tool_call in tool_calls]
+	return serialized
+
 async def run_agent(
-		provider: ScriptedProvider,
+		provider: ModelProvider,
 		user_content: str,
 		max_model_calls: int
 ) -> tuple[str, list[dict]]:
@@ -102,12 +127,13 @@ async def run_agent(
 	]
 
 	for _ in range(max_model_calls):
-		model_response = await provider.chat(messages)
-		tool_calls = model_response["tool_calls"]
+		request = build_model_request(messages)
+		model_response = await provider.chat(request)
+		tool_calls = model_response.tool_calls
 
 		assistant_message = {
 			"role": "assistant",
-			"content": model_response["content"]
+			"content": model_response.content
 		}
 		if tool_calls:
 			assistant_message["tool_calls"] = tool_calls
@@ -124,7 +150,7 @@ async def run_agent(
 			messages.extend(tool_results)
 			continue
 
-		content = model_response["content"]
+		content = model_response.content
 		if content:
 			return content, messages
 
@@ -143,7 +169,7 @@ async def main() -> None:
 	print(f"最终回答：{final_content}")
 	print("执行轨迹：")
 	for message in messages:
-		print(json.dumps(message, ensure_ascii=False))
+		print(json.dumps(serialize_message(message),ensure_ascii=False))
 
 if __name__ == "__main__":
 	import asyncio

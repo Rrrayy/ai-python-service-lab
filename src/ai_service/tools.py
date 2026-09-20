@@ -2,7 +2,7 @@ import json
 import asyncio
 
 from pydantic import BaseModel,Field,ConfigDict,ValidationError
-
+from .providers import ToolCall
 
 class UserProgressArguments(BaseModel):
 	model_config = ConfigDict(strict=True,extra="forbid")
@@ -90,22 +90,16 @@ tool_registry={
 }
 
 assistant_tool_calls=[
-	{
-		"id":"call_progress_001",
-		"type":"function",
-		"function":{
-			"name":"get_user_progress",
-			"arguments":'{"user_id":1}'
-		}
-	},
-	{
-		"id": "call_progress_002",
-		"type": "function",
-		"function": {
-			"name": "get_user_progress",
-			"arguments": '{"user_id":"abc"}'
-		}
-	}
+	ToolCall(
+		id="call_progress_001",
+		name="get_user_progress",
+		arguments={"user_id":1}
+	),
+	ToolCall(
+		id="call_progress_002",
+		name="get_user_progress",
+		arguments={"user_id":"abc"}
+	)
 ]
 
 def tool_error(tool_call_id:str,error_code:str,message:str)->dict:
@@ -119,9 +113,9 @@ def tool_error(tool_call_id:str,error_code:str,message:str)->dict:
 		},ensure_ascii=False)
 	}
 
-async def execute_tool_call(tool_call:dict,tool_registry:dict,is_authenticated:bool)->dict:
-	name=tool_call["function"]["name"]
-	call_id=tool_call["id"]
+async def execute_tool_call(tool_call:ToolCall,tool_registry:dict,is_authenticated:bool)->dict:
+	name=tool_call.name
+	call_id=tool_call.id
 	if name not in tool_registry:
 		return tool_error(call_id, "TOOL_NOT_FOUND", f"工具 {name} 不存在")
 	tool_definition=tool_registry[name]
@@ -129,12 +123,7 @@ async def execute_tool_call(tool_call:dict,tool_registry:dict,is_authenticated:b
 		return	tool_error(call_id,"TOOL_UNAUTHORIZED","调用工具需要认证")
 
 	argument_model = tool_registry[name]["argument_model"]
-	try:
-		arguments=json.loads(tool_call["function"]["arguments"])
-	except json.JSONDecodeError:
-		return tool_error(call_id,"INVALID_TOOL_ARGUMENTS","arguments不是合法JSON")
-	if not isinstance(arguments, dict):
-		return tool_error(call_id,"INVALID_TOOL_ARGUMENTS","arguments解析后必须是对象")
+	arguments=tool_call.arguments
 	try:
 		validated=argument_model.model_validate(arguments)
 	except ValidationError :
@@ -153,11 +142,11 @@ async def execute_tool_call(tool_call:dict,tool_registry:dict,is_authenticated:b
 		return tool_error(call_id,"TOOL_EXECUTION_FAILED",str(error))
 	return {
 		"role":"tool",
-		"tool_call_id":tool_call["id"],
+		"tool_call_id":tool_call.id,
 		"content":json.dumps(result,ensure_ascii=False)
 	}
 
-async def execute_tool_calls(tool_calls:list[dict],tool_registry:dict,is_authenticated:bool)->list[dict]:
+async def execute_tool_calls(tool_calls:list[ToolCall],tool_registry:dict,is_authenticated:bool)->list[dict]:
 	coroutines=[]
 	for tool_call in tool_calls:
 		coroutine=execute_tool_call(tool_call,tool_registry,is_authenticated)
