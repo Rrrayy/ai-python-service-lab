@@ -12,7 +12,10 @@
 - 统一的 `ModelRequest`、`ModelResponse`、`ToolCall` 和 Token usage
 - Provider 网络、HTTP、JSON 与协议错误分层
 - Tool Runtime 参数校验、权限、超时、取消与并发执行
-- Mock Agent Loop 消息回填、多工具调用与结果完整性检查
+- Agent Loop 消息回填、多工具调用、二次模型调用与结果完整性检查
+- Provider、Agent Loop、Tool Runtime 的统一 `ToolCall` 对象协议
+- assistant 工具调用历史向 OpenAI-compatible 协议的反向序列化
+- Provider → Agent Loop → Tool Runtime 的跨模块 Function Calling 集成测试
 - 基于 `httpx.MockTransport` 和 pytest 的确定性测试
 
 ## 架构
@@ -56,7 +59,9 @@ src/ai_service/
 
 tests/
 ├── test_async_basics.py
-└── test_providers.py
+├── test_providers.py
+├── test_tools.py
+└── test_agent_loop.py
 ```
 
 ## 环境
@@ -81,7 +86,7 @@ E:\python\python3.14.0\python.exe -m pytest -v
 当前测试基线：
 
 ```text
-20 passed
+29 passed
 ```
 
 运行 Mock Agent Loop：
@@ -100,7 +105,9 @@ system
 → assistant(final)
 ```
 
-## Provider 测试范围
+## 测试范围
+
+### Provider
 
 正常路径：
 
@@ -116,19 +123,50 @@ system
 - 缺失工具调用 ID 或工具名称
 - 工具参数不是合法 JSON 对象
 
+### Tool Runtime
+
+- 工具正常执行和结果序列化
+- 参数类型错误与未知工具
+- 未认证调用
+- 工具执行超时
+- 工具业务异常
+- 多工具调用的 ID 保留
+
+### 三层集成
+
+- Agent Loop 使用真实 `OpenAICompatibleProvider` 接口
+- 第一次模型响应解析为多个 `ToolCall`
+- Tool Runtime 执行并回填全部工具结果
+- 第二次请求包含完整的 `assistant.tool_calls`
+- `assistant.tool_calls[].id` 与 `tool.tool_call_id` 集合一致
+- 第二次模型调用返回最终回答
+
 ## 当前状态
 
-Provider 已完成非流式 OpenAI-compatible 协议的 Mock 正常与失败闭环。Tool Runtime 和 Mock Agent Loop 也已分别完成最小实现。
+Provider 已完成非流式 OpenAI-compatible 协议的 Mock 正常与失败闭环。Agent Loop 和 Tool Runtime 已统一使用 `ModelRequest`、`ModelResponse` 与 `ToolCall`，并通过两轮模型调用集成测试。
 
-`providers.py` 已升级为基于 `ModelRequest`、`ModelResponse` 和 `ToolCall` 的统一对象协议；`app.py`、`agent_loop.py` 与 `tools.py` 仍保留旧字典接口，当前正在进行接口统一。因此 FastAPI 入口暂不作为当前版本的运行入口。
+当前能够确定性验证：
+
+```text
+Agent Loop
+→ OpenAICompatibleProvider
+→ 模型 tool_calls
+→ Tool Runtime
+→ assistant/tool 消息回填
+→ 第二次模型调用
+→ 最终回答
+```
+
+`app.py` 仍保留早期 FastAPI 接口和旧 Provider 符号，暂未接入最新三层对象协议，因此 FastAPI 入口不是当前 Agent Runtime 的正式运行入口。
+
+Structured Output 已完成原理、分层边界、JSON Schema、本地 Pydantic 校验和失败策略学习，但 `response_schema` 尚未写入 `ModelRequest` 和 Provider，不能视为已实现功能。
 
 ## 下一步
 
 ```text
-统一 Provider、Agent Loop 与 Tool Runtime 的内部接口
-→ 完成 Function Calling 二次模型调用闭环
+实现 Structured Output 的 response_schema 请求与本地校验
+→ 补充 Structured Output 正常和失败测试
 → 接入真实模型 API
-→ Structured Output 与 Prompt 工程
 → SSE 流式输出、客户端断开与 Token/成本统计
 → Context Engineering、RAG 与 Agent 状态管理
 ```
