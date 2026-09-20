@@ -315,3 +315,68 @@ def test_tool_response()->None:
 	assert tool_call.id=="call_progress_001"
 	assert tool_call.name=="get_user_progress"
 	assert tool_call.arguments=={"user_id":1}
+
+
+def test_build_payload_serializes_tool_history()->None:
+	request=ModelRequest(
+		model="mock-model",
+		messages=[
+			Message(
+				role="user",
+				content="查询学习进度"
+			),
+			Message(
+				role="assistant",
+				content=None,
+				tool_calls=[
+					{
+						"id":"call_001",
+						"name":"get_user_progress",
+						"arguments":{"user_id":1}
+					}
+				]
+			),
+			Message(
+				role="tool",
+				content='{"user_id":1,"completed":12}',
+				tool_call_id="call_001"
+			)
+		],
+		temperature=0.7
+	)
+
+	async def run()->dict:
+		async with httpx.AsyncClient() as http_client:
+			provider=OpenAICompatibleProvider(
+				base_url="https://example.com",
+				api_key="test-key",
+				http_client=http_client
+			)
+			return provider.build_payload(request)
+
+	payload=asyncio.run(run())
+	messages=payload["messages"]
+
+	assert messages[0]=={
+		"role":"user",
+		"content":"查询学习进度"
+	}
+	assert messages[1]=={
+		"role":"assistant",
+		"content":None,
+		"tool_calls":[
+			{
+				"id":"call_001",
+				"type":"function",
+				"function":{
+					"name":"get_user_progress",
+					"arguments":"{\"user_id\":1}"
+				}
+			}
+		]
+	}
+	assert messages[2]=={
+		"role":"tool",
+		"content":"{\"user_id\":1,\"completed\":12}",
+		"tool_call_id":"call_001"
+	}

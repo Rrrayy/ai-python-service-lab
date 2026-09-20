@@ -99,7 +99,7 @@ class OpenAICompatibleProvider(ModelProvider):
 		payload={
 			"model":request.model,
 			"messages":[
-				message.model_dump(exclude_none=True)
+				self.serialize_message(message)
 				for message in request.messages
 			],
 			"temperature":request.temperature,
@@ -261,3 +261,36 @@ class OpenAICompatibleProvider(ModelProvider):
 
 		return self.parse_response(response_data)
 
+	def serialize_message(self, message: Message) -> dict[str, Any]:
+		result = {
+			"role": message.role,
+			"content": message.content
+		}
+
+		if message.tool_calls:
+			external_tool_calls = []
+			for item in message.tool_calls:
+				try:
+					tool_call = ToolCall.model_validate(item)
+				except ValidationError as error:
+					raise ProviderProtocolError("内部工具调用格式错误") from error
+
+				external_tool_calls.append({
+					"id": tool_call.id,
+					"type": "function",
+					"function": {
+						"name": tool_call.name,
+						"arguments": json.dumps(
+							tool_call.arguments,
+							ensure_ascii=False,
+							separators=(",", ":")
+						)
+					}
+				})
+
+			result["tool_calls"] = external_tool_calls
+
+		if message.tool_call_id is not None:
+			result["tool_call_id"] = message.tool_call_id
+
+		return result
