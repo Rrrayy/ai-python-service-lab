@@ -60,6 +60,7 @@ class ModelRequest(BaseModel):
 	model:str
 	messages:list[Message]
 	tools: list[ToolDefinition] = Field(default_factory=list)
+	response_schema: dict[str, Any] | None = None
 	temperature: float = Field(ge=0)
 	stream: bool = False
 
@@ -113,6 +114,15 @@ class OpenAICompatibleProvider(ModelProvider):
 				}
 				for tool in request.tools
 			]
+		if request.response_schema is not None:
+			payload["response_format"]={
+				"type":"json_schema",
+				"json_schema":{
+					"name":"structured_output",
+					"strict":True,
+					"schema":request.response_schema
+				}
+			}
 		return payload
 
 	# {
