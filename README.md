@@ -1,180 +1,219 @@
-# AI Service Lab
+# Agent Service Lab
 
-一个面向 AI 应用后端与 Agent Runtime 的工程实验仓库。
+一个基于 Python、FastAPI 和 OpenAI-compatible API 的 Agent 后端服务实验项目。
 
-项目从 Python 异步服务出发，逐步实现模型 Provider、工具执行 Runtime 和 Agent Loop。重点不是堆叠框架，而是理解模型调用链，并通过正常路径、失败路径和自动化测试验证每一层的职责与边界。
+本项目实现并验证一条可测试的非流式 Agent 调用链：
 
-## 当前能力
+```text
+客户端请求
+    ↓
+FastAPI
+    ↓
+Agent Loop
+    ├── Provider → 模型 API
+    └── Tool Runtime → 注册工具
+    ↓
+结构化结果校验
+    ↓
+诊断业务结果
+```
 
-- `asyncio` 并发、超时、取消、重试、背压与优雅关闭
-- FastAPI 请求校验、依赖注入、异常处理、中间件与生命周期
+项目重点是清晰的模块边界、确定性的失败处理和可回归测试，不把模型输出直接当成可执行代码或可信业务结果。
+
+## 核心能力
+
+- `asyncio` 异步任务、超时、取消、并发和资源清理
+- FastAPI 请求校验、依赖注入、异常处理、中间件和生命周期
+- Pydantic 严格类型校验和业务规则校验
 - OpenAI-compatible Provider 请求组装与响应解析
-- 统一的 `ModelRequest`、`ModelResponse`、`ToolCall` 和 Token usage
-- Provider 网络、HTTP、JSON 与协议错误分层
-- Tool Runtime 参数校验、权限、超时、取消与并发执行
-- Agent Loop 消息回填、多工具调用、二次模型调用与结果完整性检查
-- Provider、Agent Loop、Tool Runtime 的统一 `ToolCall` 对象协议
-- assistant 工具调用历史向 OpenAI-compatible 协议的反向序列化
-- Provider → Agent Loop → Tool Runtime 的跨模块 Function Calling 集成测试
-- 基于 `httpx.MockTransport` 和 pytest 的确定性测试
+- Provider 网络、HTTP、认证、限流、上游和协议错误分层
+- `ModelRequest`、`ModelResponse`、`Message`、`ToolCall`、`TokenUsage` 内部协议
+- Tool Runtime 工具注册、参数校验、权限、超时、取消和并发执行
+- Agent Loop 消息历史、工具调用、结果回填和二次模型调用
+- 多工具调用的 `tool_call_id` 完整性验证
+- Structured Output 的 JSON Schema 请求包装和本地校验
+- DiagnoseReport 字段校验、业务规则校验和有限格式修复
+- `httpx.MockTransport` 和 pytest 确定性测试
+
+当前全量测试基线：
+
+```text
+43 passed
+```
 
 ## 架构
 
 ```text
-Client
-  ↓
+客户端
+  ↓ HTTP
 FastAPI
   ↓
+Diagnose Service
+  ↓
 Agent Loop
-  ├──→ Model Provider ──→ OpenAI-compatible Model API
-  └──→ Tool Runtime ────→ Registered Tools
+  ├──→ Provider ──→ OpenAI-compatible Model API
+  └──→ Tool Runtime ──→ Registered Tools
+  ↓
+ModelResponse.content
+  ↓
+DiagnosisReport 校验
+  ↓
+业务结果
 ```
 
-模块职责：
+### FastAPI
 
-```text
-FastAPI
-→ HTTP 接入、输入校验、请求上下文和错误响应
+负责 HTTP 接入、请求参数校验、请求上下文、生命周期管理和外部错误响应。
 
-Model Provider
-→ 供应商请求组装、HTTP 调用、响应解析和错误转换
+### Diagnose Service
 
-Agent Loop
-→ 维护消息历史、推进模型与工具调用、控制任务终止
+负责组织一次诊断业务：调用 Agent Loop、解析最终模型内容、执行有限结构化修复，并返回通过校验的 `DiagnosisReport`。
 
-Tool Runtime
-→ 工具白名单、参数校验、权限、超时、取消和执行
-```
+### Agent Loop
+
+负责维护 `messages`，调用 Provider，识别 `tool_calls`，执行工具，回填 assistant/tool 消息，并控制模型调用次数。
+
+### Provider
+
+负责供应商请求组装、HTTP 调用、认证头、响应解析和 Provider 错误转换。Provider 不执行工具，也不判断诊断内容是否符合业务规则。
+
+### Tool Runtime
+
+负责工具白名单、参数模型、权限检查、超时、取消、业务异常和工具结果协议。
+
+### Diagnosis
+
+负责把模型最终返回的字符串解析成结构化报告，并执行字段、类型、范围和诊断业务规则校验。
 
 ## 项目结构
 
 ```text
 src/ai_service/
-├── app.py             # FastAPI 服务与请求生命周期实验
-├── async_basics.py    # asyncio 可靠性与并发控制实验
-├── config.py          # 环境变量配置与启动校验
-├── providers.py       # 模型 Provider 与统一内部协议
-├── tools.py           # Tool Runtime 与工具注册表
-└── agent_loop.py      # Mock Agent Loop 与消息执行轨迹
+├── app.py                    # FastAPI 应用、生命周期和请求中间件
+├── async_basics.py           # asyncio 并发、超时、取消和背压实验
+├── config.py                 # 环境变量配置和启动校验
+├── providers.py              # Provider 抽象、内部协议和供应商适配
+├── tools.py                  # Tool Runtime、工具注册表和工具执行器
+├── agent_loop.py             # Agent Loop、消息追加和循环控制
+├── diagnosis.py              # DiagnosisReport 和结构化业务校验
+└── diagnosis_service.py      # 诊断业务流程和格式修复
 
 tests/
 ├── test_async_basics.py
 ├── test_providers.py
 ├── test_tools.py
-└── test_agent_loop.py
+├── test_agent_loop.py
+├── test_structured_output.py
+└── test_diagnosis_service.py
 ```
 
-## 环境
+## 环境要求
 
 - Python 3.14
-- Windows 为当前开发环境
+- Windows
 
-安装当前实验所需依赖：
+安装依赖：
 
 ```powershell
 E:\python\python3.14.0\python.exe -m pip install fastapi uvicorn httpx pydantic pydantic-settings pytest
 ```
 
-## 运行验证
+## 运行和验证
 
-运行全部自动化测试：
+运行全部测试：
 
 ```powershell
-E:\python\python3.14.0\python.exe -m pytest -v
+E:\python\python3.14.0\python.exe -m pytest -q
 ```
 
-当前测试基线：
-
-```text
-29 passed
-```
-
-运行 Mock Agent Loop：
+运行 Agent Loop 实验：
 
 ```powershell
 E:\python\python3.14.0\python.exe -m src.ai_service.agent_loop
 ```
 
-该实验会输出一次完整轨迹：
+编译核心模块：
 
-```text
-system
-→ user
-→ assistant(tool_calls)
-→ tool(result)
-→ assistant(final)
+```powershell
+E:\python\python3.14.0\python.exe -m py_compile src\ai_service\providers.py src\ai_service\tools.py src\ai_service\agent_loop.py src\ai_service\diagnosis.py src\ai_service\diagnosis_service.py
 ```
 
-## 测试范围
+启动 FastAPI 开发服务：
 
-### Provider
-
-正常路径：
-
-- 普通文本、结束原因和 Token usage
-- 工具调用 ID、工具名称和参数解析
-
-失败路径：
-
-- 请求超时与连接失败
-- HTTP 401、429、503
-- 非法 JSON、缺失或空 `choices`
-- 非法 `tool_calls` 结构
-- 缺失工具调用 ID 或工具名称
-- 工具参数不是合法 JSON 对象
-
-### Tool Runtime
-
-- 工具正常执行和结果序列化
-- 参数类型错误与未知工具
-- 未认证调用
-- 工具执行超时
-- 工具业务异常
-- 多工具调用的 ID 保留
-
-### 三层集成
-
-- Agent Loop 使用真实 `OpenAICompatibleProvider` 接口
-- 第一次模型响应解析为多个 `ToolCall`
-- Tool Runtime 执行并回填全部工具结果
-- 第二次请求包含完整的 `assistant.tool_calls`
-- `assistant.tool_calls[].id` 与 `tool.tool_call_id` 集合一致
-- 第二次模型调用返回最终回答
-
-## 当前状态
-
-Provider 已完成非流式 OpenAI-compatible 协议的 Mock 正常与失败闭环。Agent Loop 和 Tool Runtime 已统一使用 `ModelRequest`、`ModelResponse` 与 `ToolCall`，并通过两轮模型调用集成测试。
-
-当前能够确定性验证：
-
-```text
-Agent Loop
-→ OpenAICompatibleProvider
-→ 模型 tool_calls
-→ Tool Runtime
-→ assistant/tool 消息回填
-→ 第二次模型调用
-→ 最终回答
+```powershell
+E:\python\python3.14.0\python.exe -m uvicorn src.ai_service.app:app --reload
 ```
 
-`app.py` 仍保留早期 FastAPI 接口和旧 Provider 符号，暂未接入最新三层对象协议，因此 FastAPI 入口不是当前 Agent Runtime 的正式运行入口。
+## 测试覆盖
 
-Structured Output 已完成原理、分层边界、JSON Schema、本地 Pydantic 校验和失败策略学习，但 `response_schema` 尚未写入 `ModelRequest` 和 Provider，不能视为已实现功能。
+### Provider 测试
 
-## 下一步
+- 普通文本响应解析；
+- 工具调用响应解析；
+- 工具调用 ID、名称和 JSON arguments 校验；
+- assistant 工具调用历史序列化；
+- `response_schema` 到供应商 `response_format` 的包装；
+- 请求超时、连接失败、HTTP 401、429、503；
+- 非法 JSON、缺失 choices、空 choices 和非法响应结构。
+
+### Tool Runtime 测试
+
+- 正常工具执行；
+- 未知工具；
+- 参数类型错误和额外字段；
+- 未认证调用；
+- 工具超时；
+- 工具执行异常；
+- 外部取消和 `finally` 清理；
+- 多工具并发以及逐个调用 ID 关联结果。
+
+### Agent Loop 测试
+
+- 模型返回多个工具调用；
+- assistant/tool 消息因果链；
+- 工具结果缺失、多出或重复；
+- 工具结果回填后的二次模型调用；
+- 最大模型调用次数；
+- `tool_calls` 与普通 content 同时出现时优先处理工具调用。
+
+### Diagnose 测试
+
+- 合法 JSON 转为 `DiagnosisReport`；
+- 非法 JSON、缺字段、类型错误、范围错误和额外字段；
+- 高置信度报告的证据数量业务规则；
+- 第一次结构化失败、第二次修复成功；
+- 修复请求不携带工具并重新携带 Schema；
+- 修复阶段返回工具调用或空内容；
+- 修复失败后停止，不进行无限重试。
+
+## 关键工程约束
 
 ```text
-实现 Structured Output 的 response_schema 请求与本地校验
-→ 补充 Structured Output 正常和失败测试
-→ 接入真实模型 API
-→ SSE 流式输出、客户端断开与 Token/成本统计
-→ Context Engineering、RAG 与 Agent 状态管理
+模型只能提出工具调用，不能直接执行本地函数。
+
+Provider 只负责网络和供应商协议，不负责业务判断。
+
+Agent Loop 结束不等于业务结果合格。
+
+只有通过 DiagnosisReport 校验的结果才能作为成功业务结果。
+
+结构化输出修复阶段禁止重新执行工具。
+
+工具失败必须生成带原始 tool_call_id 的工具结果。
+
+内部异常保留给日志，客户端只接收稳定错误协议。
+
+所有重试都有次数、时间、Token 和成本边界。
 ```
 
-## 项目原则
+## 当前限制
 
-- 先用 Mock 建立确定性实验，再接入真实模型
-- 先理解原始协议和运行机制，再引入 Agent 框架
-- 不以“成功运行一次”作为完成标准
-- 每个核心模块都验证正常、异常、超时和边界路径
-- 对尚未实现的能力保持明确，不把规划包装成成果
+当前仓库仍是非流式 Agent Runtime 实验服务，以下能力尚未接入完整链路：
+
+- 新版 Diagnose 业务尚未接入正式 FastAPI 诊断接口；
+- SSE 流式输出和客户端断开处理；
+- 真实模型 API 的完整 Function Calling 验证；
+- Token、TTFT、TPOT、延迟和成本统计；
+- 生产级持久化、鉴权、租户隔离和部署配置。
+
+这些限制会在后续工程迭代中单独实现和验证，不将规划内容当作当前功能。
