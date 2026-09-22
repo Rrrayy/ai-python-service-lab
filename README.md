@@ -33,6 +33,8 @@ Agent Loop
 - 多工具调用的 `tool_call_id` 完整性验证
 - Structured Output 的 JSON Schema 请求包装和本地校验
 - DiagnoseReport 字段校验、业务规则校验和有限格式修复
+- 响应层成功/失败协议、异常映射和内部错误脱敏
+- Diagnosis Handler 连接诊断业务与响应层
 - `httpx.MockTransport` 和 pytest 确定性测试
 
 当前全量测试基线：
@@ -104,7 +106,9 @@ tests/
 ├── test_tools.py
 ├── test_agent_loop.py
 ├── test_structured_output.py
-└── test_diagnosis_service.py
+├── test_diagnosis_service.py
+├── test_response.py
+└── test_diagnosis_handler.py
 ```
 
 ## 环境要求
@@ -186,6 +190,15 @@ E:\python\python3.14.0\python.exe -m uvicorn src.ai_service.app:app --reload
 - 修复阶段返回工具调用或空内容；
 - 修复失败后停止，不进行无限重试。
 
+### Response 与业务连接测试
+
+- `DiagnosisReport` 包装为稳定成功响应；
+- Provider 超时、认证、限流、上游和协议错误映射为稳定错误码；
+- `StructuredOutputError` 和 `DiagnosisProtocolError` 映射为诊断错误；
+- 未知异常返回通用错误，不泄漏内部细节；
+- `diagnosis_handler` 成功路径返回 `ok/data/request_id`；
+- `diagnosis_handler` 失败路径返回 `ok/error/request_id`。
+
 ## 关键工程约束
 
 ```text
@@ -211,6 +224,7 @@ Agent Loop 结束不等于业务结果合格。
 当前仓库仍是非流式 Agent Runtime 实验服务，以下能力尚未接入完整链路：
 
 - 新版 Diagnose 业务尚未接入正式 FastAPI 诊断接口；
+- 响应层和 Diagnosis Handler 已完成独立连接，尚未接入 HTTP 状态码和正式路由；
 - SSE 流式输出和客户端断开处理；
 - 真实模型 API 的完整 Function Calling 验证；
 - Token、TTFT、TPOT、延迟和成本统计；
