@@ -79,9 +79,28 @@ class ModelProvider(ABC):
 
 class MockProvider(ModelProvider):
 	async def chat(self,request:ModelRequest)->ModelResponse:
+		if request.response_schema is not None:
+			return ModelResponse(
+				content=json.dumps(
+					{
+						"root_cause":"数据库连接池耗尽",
+						"confidence":0.92,
+						"evidence":[
+							"连接数达到上限",
+							"连接池活跃连接持续增长",
+						],
+						"recommendations":[
+							"检查连接释放逻辑",
+						],
+					},
+					ensure_ascii=False,
+				),
+				finish_reason="stop",
+			)
+
 		return ModelResponse(
 			content=f"收到{len(request.messages)}条消息",
-			finish_reason="stop"
+			finish_reason="stop",
 		)
 
 class OpenAICompatibleProvider(ModelProvider):
