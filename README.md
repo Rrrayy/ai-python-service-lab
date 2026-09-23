@@ -37,10 +37,11 @@ Agent Loop
 - Diagnosis Handler 连接诊断业务与响应层
 - `httpx.MockTransport` 和 pytest 确定性测试
 
-当前全量测试基线：
+已验证测试基线：
 
 ```text
-43 passed
+接口层测试：8 passed
+此前核心链路基线：43 passed
 ```
 
 ## 架构
@@ -98,7 +99,9 @@ src/ai_service/
 ├── tools.py                  # Tool Runtime、工具注册表和工具执行器
 ├── agent_loop.py             # Agent Loop、消息追加和循环控制
 ├── diagnosis.py              # DiagnosisReport 和结构化业务校验
-└── diagnosis_service.py      # 诊断业务流程和格式修复
+├── diagnosis_service.py      # 诊断业务流程和格式修复
+├── diagnosis_handler.py      # 连接诊断业务与响应协议
+└── response.py               # 成功/失败响应模型和异常映射
 
 tests/
 ├── test_async_basics.py
@@ -108,7 +111,8 @@ tests/
 ├── test_structured_output.py
 ├── test_diagnosis_service.py
 ├── test_response.py
-└── test_diagnosis_handler.py
+├── test_diagnosis_handler.py
+└── test_app.py
 ```
 
 ## 环境要求
@@ -199,6 +203,26 @@ E:\python\python3.14.0\python.exe -m uvicorn src.ai_service.app:app --reload
 - `diagnosis_handler` 成功路径返回 `ok/data/request_id`；
 - `diagnosis_handler` 失败路径返回 `ok/error/request_id`。
 
+### FastAPI 接口测试
+
+- `/health` 健康检查；
+- 合法诊断请求返回 HTTP 200；
+- 缺少 `content` 和纯空白 `content` 返回 HTTP 422；
+- Provider 超时映射为 HTTP 504；
+- Provider 限流映射为 HTTP 429；
+- Provider 上游错误映射为 HTTP 502；
+- 未知异常映射为 HTTP 500；
+- 验证 `request_id` 和处理耗时响应头。
+
+### Response 与业务连接测试
+
+- `DiagnosisReport` 包装为稳定成功响应；
+- Provider 超时、认证、限流、上游和协议错误映射为稳定错误码；
+- `StructuredOutputError` 和 `DiagnosisProtocolError` 映射为诊断错误；
+- 未知异常返回通用错误，不泄漏内部细节；
+- `diagnosis_handler` 成功路径返回 `ok/data/request_id`；
+- `diagnosis_handler` 失败路径返回 `ok/error/request_id`。
+
 ## 关键工程约束
 
 ```text
@@ -223,8 +247,8 @@ Agent Loop 结束不等于业务结果合格。
 
 当前仓库仍是非流式 Agent Runtime 实验服务，以下能力尚未接入完整链路：
 
-- 新版 Diagnose 业务尚未接入正式 FastAPI 诊断接口；
-- 响应层和 Diagnosis Handler 已完成独立连接，尚未接入 HTTP 状态码和正式路由；
+- FastAPI 诊断接口已完成第一版，仍需继续完善统一请求校验错误协议和生产级异常处理；
+- 响应层、Diagnosis Handler 和 HTTP 状态码映射已完成基础连接；
 - SSE 流式输出和客户端断开处理；
 - 真实模型 API 的完整 Function Calling 验证；
 - Token、TTFT、TPOT、延迟和成本统计；
