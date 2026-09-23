@@ -1,4 +1,3 @@
-import asyncio
 import json
 import re
 import time
@@ -6,249 +5,237 @@ import uuid
 from contextlib import asynccontextmanager
 
 import httpx
+from typing import Annotated
 from fastapi import Depends,FastAPI,Request
-from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel,Field
+from pydantic import BaseModel,Field,StringConstraints
 
 from .config import Settings,validate_settings
-from .providers import ModelProvider,ModelProviderError,ModelUpstreamError,create_provider
-
-DEFAULT_MODEL="mock-model"
-
-
-class ChatMessage(BaseModel):
-	role:str
-	content:str
+from .diagnosis_handler import handle_diagnosis
+from .providers import (
+	ModelProvider,
+	MockProvider,
+	OpenAICompatibleProvider,
+)
 
 
-class ChatRequest(BaseModel):
-	model:str
-	messages:list[ChatMessage]
-	temperature:float=Field(default=0.7,ge=0,le=2)
+from typing import Annotated
+
+from pydantic import BaseModel,StringConstraints
 
 
-class ChatResponse(BaseModel):
-	model:str
-	content:str
-	success:bool=True
-	error:str|None=None
+class DiagnosisRequest(BaseModel):
+	content:Annotated[
+		str,
+		StringConstraints(
+			strip_whitespace=True,
+			min_length=1,
+			max_length=10000,
+		),
+	]
 
 
-class ApiError(Exception):
-	def __init__(self,status_code:int,code:str,message:str):
-		super().__init__(message)
-		self.status_code=status_code
-		self.code=code
-		self.message=message
+REQUEST_ID_PATTERN=re.compile(
+	r"^[A-Za-z0-9._-]{1,64}$"
+)
 
-REQUEST_ID_PATTERN=re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 def new_request_id()->str:
+	# 生成当前请求的新 ID
 	return uuid.uuid4().hex
 
+
 def resolve_request_id(request:Request)->str:
-	client_request_id=request.headers.get("X-Request-ID")
-	if client_request_id is not None and REQUEST_ID_PATTERN.fullmatch(client_request_id):
+	# 读取客户端传入的请求 ID
+	client_request_id=request.headers.get(
+		"X-Request-ID"
+	)
+	# 只有符合规则的请求 ID 才允许透传
+	if (
+		client_request_id is not None
+		and REQUEST_ID_PATTERN.fullmatch(client_request_id)
+	):
 		return client_request_id
+
+	# 客户端没有传入或格式非法时由服务端生成
 	return new_request_id()
 
-def resolve_trace_id(request:Request,request_id:str)->str:
-	client_trace_id=request.headers.get("X-Trace-ID")
-	if client_trace_id is not None and REQUEST_ID_PATTERN.fullmatch(client_trace_id):
-		return client_trace_id
-	return request_id
-
-def get_request_id(request:Request)->str:
-	return request.state.request_id
-
-def get_settings(request:Request)->Settings:
-	return request.app.state.settings
-
-def get_model_client(request:Request)->httpx.AsyncClient:
-	return request.app.state.model_client
 
 def get_provider(request:Request)->ModelProvider:
+	# 从应用生命周期保存的状态中获取 Provider
 	return request.app.state.provider
+
+
+def get_request_id(request:Request)->str:
+	# 获取请求中间件提前保存的 request_id
+	return request.state.request_id
+
+
+def build_provider(
+	settings:Settings,
+	http_client:httpx.AsyncClient,
+)->ModelProvider:
+	# mock 模式使用确定性的本地 Provider
+	if settings.provider=="mock":
+		return MockProvider()
+
+	# 真实 Provider 使用 OpenAI-compatible HTTP 接口
+	if settings.api_key is None or settings.base_url is None:
+		raise RuntimeError(
+			"真实模型缺少 API Key 或 Base URL"
+		)
+
+	return OpenAICompatibleProvider(
+		base_url=settings.base_url,
+		api_key=settings.api_key,
+		http_client=http_client,
+	)
+
 
 @asynccontextmanager
 async def lifespan(app:FastAPI):
+	# 读取环境变量和配置文件
 	settings=Settings()
+
+	# 启动时验证配置是否满足当前 Provider 要求
 	validate_settings(settings)
-	model_client=httpx.AsyncClient(timeout=settings.timeout)
+
+	# 创建应用生命周期内共享的 HTTP 客户端
+	http_client=httpx.AsyncClient(
+		timeout=settings.timeout
+	)
+
 	try:
-		provider=create_provider(settings.provider,settings,model_client)
+		# 在应用启动时创建 Provider
+		provider=build_provider(
+			settings=settings,
+			http_client=http_client,
+		)
+
+		# 将共享对象放入 app.state
 		app.state.settings=settings
 		app.state.provider=provider
-		app.state.model_client=model_client
-		print(
-			f"服务启动：provider={settings.provider},"
-			f"model={settings.model_name},"
-			f"has_api_key={settings.api_key is not None}"
-		)
-		yield
-	finally:
-		await model_client.aclose()
-		print("服务关闭：模型客户端已释放")
+		app.state.http_client=http_client
 
-app=FastAPI(lifespan=lifespan)
+		# 让 FastAPI 进入运行状态
+		yield
+
+	finally:
+		# 应用关闭时释放 HTTP 连接池
+		await http_client.aclose()
+
+
+app=FastAPI(
+	title="Agent Service Lab",
+	version="1.0.0",
+	lifespan=lifespan,
+)
+
 
 @app.middleware("http")
-async def track_request(request:Request,call_next):
+async def request_context(
+	request:Request,
+	call_next,
+):
+	# 为当前 HTTP 请求生成或读取 request_id
 	request_id=resolve_request_id(request)
-	trace_id=resolve_trace_id(request,request_id)
+
+	# 将 request_id 放进当前请求上下文
 	request.state.request_id=request_id
-	request.state.trace_id=trace_id
+
+	# 记录请求开始时间
 	start_time=time.perf_counter()
-	response=None
-	try:
-		response=await call_next(request)
-		return response
-	finally:
-		elapsed_ms=(time.perf_counter()-start_time)*1000
-		status_code=response.status_code if response is not None else 500
-		if response is not None:
-			response.headers["X-Process-Time"]=f"{elapsed_ms:.2f}"
-			response.headers["X-Request-ID"]=request_id
-			response.headers["X-Trace-ID"]=trace_id
-		access_log={
-			"request_id":request_id,
-			"trace_id":trace_id,
-			"method":request.method,
-			"path":request.url.path,
-			"status_code":status_code,
-			"elapsed_ms":round(elapsed_ms,2)
-		}
-		print(json.dumps(access_log,ensure_ascii=False))
 
-def get_model_name()->str:
-	return DEFAULT_MODEL
+	# 执行真正的路由函数
+	response=await call_next(request)
+
+	# 计算请求处理耗时
+	elapsed_ms=(
+		time.perf_counter()-start_time
+	)*1000
+
+	# 把请求 ID 和耗时返回给客户端
+	response.headers["X-Request-ID"]=request_id
+	response.headers["X-Process-Time"]=(
+		f"{elapsed_ms:.2f}"
+	)
+
+	# 输出最小结构化访问日志
+	print(
+		json.dumps(
+			{
+				"request_id":request_id,
+				"method":request.method,
+				"path":request.url.path,
+				"status_code":response.status_code,
+				"elapsed_ms":round(elapsed_ms,2),
+			},
+			ensure_ascii=False,
+		)
+	)
+
+	# 返回 HTTP 响应
+	return response
 
 
-@app.exception_handler(ApiError)
-async def handle_api_error(request:Request,error:ApiError):
-	return JSONResponse(
-		status_code=error.status_code,
-		content={
-			"code":error.code,
-			"message":error.message
-		}
+def resolve_status_code(result:dict)->int:
+	# 业务成功统一对应 HTTP 200
+	if result.get("ok") is True:
+		return 200
+
+	# 从统一错误响应中读取业务错误码
+	error=result.get("error",{})
+	error_code=error.get("code")
+
+	# 业务错误码到 HTTP 状态码的映射
+	status_code_map={
+		"MODEL_TIMEOUT":504,
+		"MODEL_RATE_LIMITED":429,
+		"MODEL_AUTHENTICATION_FAILED":502,
+		"MODEL_UPSTREAM_ERROR":502,
+		"MODEL_INVALID_RESPONSE":502,
+		"DIAGNOSIS_INVALID":502,
+		"INTERNAL_ERROR":500,
+	}
+
+	# 未知错误默认按照服务器内部错误处理
+	return status_code_map.get(
+		error_code,
+		500,
 	)
 
 
-@app.exception_handler(RequestValidationError)
-async def handle_validation_error(request:Request,error:RequestValidationError):
-	details=[]
-	for item in error.errors():
-		details.append({
-			"location":list(item["loc"]),
-			"type":item["type"],
-			"message":item["msg"]
-		})
+def to_http_response(result:dict)->JSONResponse:
+	# 根据业务结果决定 HTTP 状态码
+	status_code=resolve_status_code(result)
+
+	# 将统一结果字典包装为真正的 HTTP JSON 响应
 	return JSONResponse(
-		status_code=422,
-		content={
-			"code":"REQUEST_VALIDATION_ERROR",
-			"message":"请求参数校验失败",
-			"details":details
-		}
+		status_code=status_code,
+		content=result,
 	)
 
-@app.exception_handler(ModelUpstreamError)
-async def handle_model_upstream_error(
-	request:Request,
-	error:ModelUpstreamError
-):
-	return JSONResponse(
-		status_code=502,
-		content={
-			"code":"MODEL_UPSTREAM_ERROR",
-			"message":str(error)
-		}
-	)
-
-
-@app.exception_handler(ModelProviderError)
-async def handle_model_provider_error(
-	request:Request,
-	error:ModelProviderError
-):
-	return JSONResponse(
-		status_code=500,
-		content={
-			"code":"MODEL_PROVIDER_ERROR",
-			"message":str(error)
-		}
-	)
 
 @app.get("/health")
-async def health():
-	return {"status":"ok"}
-
-
-@app.get("/users")
-async def list_users(page:int=1,page_size:int=20):
+async def health()->dict[str,str]:
+	# 提供基础健康检查接口
 	return {
-		"page":page,
-		"page_size":page_size
+		"status":"ok"
 	}
 
 
-@app.get("/users/{user_id}")
-async def get_user(user_id:int):
-	return {
-		"user_id":user_id,
-		"message":"查询客户成功"
-	}
-
-
-@app.post("/v1/chat/completions",response_model=ChatResponse)
-async def chat(request:ChatRequest,provider:ModelProvider=Depends(get_provider)):
-	if not provider.supports(request.model):
-		raise ApiError(400,"MODEL_NOT_SUPPORTED",f"当前 Provider 不支持模型：{request.model}")
-	content=await provider.chat(
-		request.model,
-		[message.model_dump() for message in request.messages],
-		request.temperature
-	)
-	return ChatResponse(
-		model=request.model,
-		content=content
+@app.post("/v1/diagnosis")
+async def create_diagnosis(
+	request:DiagnosisRequest,
+	provider:ModelProvider=Depends(get_provider),
+	request_id:str=Depends(get_request_id),
+)->JSONResponse:
+	# 调用业务连接层，不在 API 层处理模型和工具细节
+	result=await handle_diagnosis(
+		provider=provider,
+		user_content=request.content,
+		request_id=request_id,
 	)
 
-
-@app.get("/model")
-async def model(model_name:str=Depends(get_model_name)):
-	return {"model":model_name}
-
-
-@app.get("/model/{model_name}")
-async def get_model(model_name:str):
-	if model_name!=DEFAULT_MODEL:
-		raise ApiError(404,"MODEL_NOT_FOUND","模型不存在")
-	return {"model":model_name}
-
-
-async def slow_model()->str:
-	await asyncio.sleep(3)
-	return "模型响应"
-
-
-@app.get("/debug/timeout")
-async def debug_timeout():
-	try:
-		result=await asyncio.wait_for(slow_model(),timeout=1)
-		return {"content":result}
-	except asyncio.TimeoutError as error:
-		raise ApiError(504,"MODEL_TIMEOUT","模型调用超时") from error
-
-@app.get("/debug/request-id")
-async def debug_request_id(request_id:str=Depends(get_request_id)):
-	return {"request_id":request_id}
-
-@app.get("/debug/model-client")
-async def debug_model_client(model_client:httpx.AsyncClient=Depends(get_model_client)):
-	return {
-		"client_id":id(model_client),
-		"is_closed":model_client.is_closed
-	}
+	# 将业务结果转换为 HTTP 状态码和 JSON 响应
+	return to_http_response(result)
