@@ -2,12 +2,17 @@ import json
 import re
 import time
 import uuid
-from contextlib import asynccontextmanager
-
+import asyncio
 import httpx
+from contextlib import asynccontextmanager
+from .SSE import (
+	enqueue_event,
+	event_stream,
+)
+
 from typing import Annotated
 from fastapi import Depends,FastAPI,Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse,StreamingResponse
 from pydantic import BaseModel,Field,StringConstraints
 
 from .config import Settings,validate_settings
@@ -204,6 +209,61 @@ def resolve_status_code(result:dict)->int:
 		500,
 	)
 
+def format_sse_event(
+	event_name:str,
+	data:dict,
+)->str:
+	# 将业务事件数据转换成 JSON 文本
+	data_text=json.dumps(
+		data,
+		ensure_ascii=False,
+	)
+
+	# 按 SSE 协议拼接 event、data 和结束空行
+	return (
+		f"event: {event_name}\n"
+		f"data: {data_text}\n"
+		"\n"
+	)
+
+async def demo_event_stream():
+	try:
+		# 第一条事件尽早发送，降低客户端等待时间
+		yield format_sse_event(
+			"status",
+			{
+				"stage":"started",
+			},
+		)
+		# 模拟 Agent 正在执行耗时操作
+		await asyncio.sleep(1)
+		# 发送第二条状态事件
+		yield format_sse_event(
+			"status",
+			{
+				"stage":"processing",
+			},
+		)
+		# 模拟模型或工具继续执行
+		await asyncio.sleep(1)
+		# 发送正常结束事件
+		yield format_sse_event(
+			"done",
+			{
+				"ok":True,
+			},
+		)
+
+	except asyncio.CancelledError:
+		# 客户端断开时执行取消分支
+		print("SSE 客户端已断开")
+
+		# 不能吞掉取消异常，要继续向上传播
+		raise
+
+	finally:
+		# 无论成功、异常还是取消都会执行清理
+		print("SSE 事件流已清理")
 
 def to_http_response(result:dict)->JSONResponse:
 	# 根据业务结果决定 HTTP 状态码
@@ -239,3 +299,77 @@ async def create_diagnosis(
 
 	# 将业务结果转换为 HTTP 状态码和 JSON 响应
 	return to_http_response(result)
+
+@app.post("/v1/diagnosis/stream")
+async def diagnosis_stream(
+	request:DiagnosisRequest,
+	provider:ModelProvider=Depends(get_provider),
+	request_id:str=Depends(get_request_id),
+)->StreamingResponse:
+	event_queue:asyncio.Queue[dict]=asyncio.Queue()
+
+	async def on_event(event:dict)->None:
+		await enqueue_event(
+			event_queue,
+			event
+		)
+
+	async def run_request()->None:
+		try:
+			result=await handle_diagnosis(
+				provider=provider,
+				user_content=request.content,
+				request_id=request_id,
+				on_event=on_event,
+			)
+
+			event_name=(
+				"diagnosis_result"
+				if result.get("ok") is True
+				else "error"
+			)
+
+			await enqueue_event(
+				event_queue,
+				{
+					"event":event_name,
+					"data":result,
+				}
+			)
+
+		finally:
+			await enqueue_event(
+				event_queue,
+				{
+					"event":"stream_finished",
+					"data":{},
+				}
+			)
+
+	async def response_stream():
+		agent_task=asyncio.create_task(
+			run_request()
+		)
+
+		try:
+			async for event_text in event_stream(event_queue):
+				yield event_text
+
+		finally:
+			if not agent_task.done():
+				agent_task.cancel()
+
+				try:
+					await agent_task
+				except asyncio.CancelledError:
+					pass
+
+	return StreamingResponse(
+		response_stream(),
+		media_type="text/event-stream",
+		headers={
+			"Cache-Control":"no-cache",
+			"Connection":"keep-alive",
+			"X-Request-ID":request_id,
+		},
+	)
