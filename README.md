@@ -2,12 +2,12 @@
 
 一个基于 Python、FastAPI 和 OpenAI-compatible API 的 Agent 后端服务实验项目。
 
-本项目实现并验证一条可测试的非流式 Agent 调用链：
+本项目实现并验证一条可测试的 Agent 调用链，支持普通 JSON 响应和 SSE 流式响应：
 
 ```text
 客户端请求
     ↓
-FastAPI
+FastAPI / SSE 适配层
     ↓
 Agent Loop
     ├── Provider → 模型 API
@@ -16,6 +16,8 @@ Agent Loop
 结构化结果校验
     ↓
 诊断业务结果
+    ↓
+JSON 或 SSE 响应
 ```
 
 项目重点是清晰的模块边界、确定性的失败处理和可回归测试，不把模型输出直接当成可执行代码或可信业务结果。
@@ -35,21 +37,24 @@ Agent Loop
 - DiagnoseReport 字段校验、业务规则校验和有限格式修复
 - 响应层成功/失败协议、异常映射和内部错误脱敏
 - Diagnosis Handler 连接诊断业务与响应层
+- SSE 事件适配、异步队列、Agent 事件回调和客户端断开取消
 - `httpx.MockTransport` 和 pytest 确定性测试
 
 已验证测试基线：
 
 ```text
-接口层测试：8 passed
-此前核心链路基线：43 passed
+当前全量测试：61 passed
+已知警告：1 条 Starlette/httpx2 弃用警告，不影响测试结果
 ```
 
 ## 架构
 
 ```text
 客户端
-  ↓ HTTP
+  ↓ HTTP / SSE
 FastAPI
+  ↓
+SSE Adapter
   ↓
 Diagnose Service
   ↓
@@ -101,7 +106,8 @@ src/ai_service/
 ├── diagnosis.py              # DiagnosisReport 和结构化业务校验
 ├── diagnosis_service.py      # 诊断业务流程和格式修复
 ├── diagnosis_handler.py      # 连接诊断业务与响应协议
-└── response.py               # 成功/失败响应模型和异常映射
+├── response.py               # 成功/失败响应模型和异常映射
+└── SSE.py                    # SSE 格式化、事件队列和流式适配
 
 tests/
 ├── test_async_basics.py
@@ -143,7 +149,7 @@ E:\python\python3.14.0\python.exe -m src.ai_service.agent_loop
 编译核心模块：
 
 ```powershell
-E:\python\python3.14.0\python.exe -m py_compile src\ai_service\providers.py src\ai_service\tools.py src\ai_service\agent_loop.py src\ai_service\diagnosis.py src\ai_service\diagnosis_service.py
+E:\python\python3.14.0\python.exe -m py_compile src\ai_service\providers.py src\ai_service\tools.py src\ai_service\agent_loop.py src\ai_service\diagnosis.py src\ai_service\diagnosis_service.py src\ai_service\diagnosis_handler.py src\ai_service\response.py src\ai_service\SSE.py src\ai_service\app.py
 ```
 
 启动 FastAPI 开发服务：
@@ -214,6 +220,15 @@ E:\python\python3.14.0\python.exe -m uvicorn src.ai_service.app:app --reload
 - 未知异常映射为 HTTP 500；
 - 验证 `request_id` 和处理耗时响应头。
 
+### SSE 流式测试
+
+- Agent Loop 事件通过异步回调进入 `asyncio.Queue`；
+- SSE 生成器逐条消费队列并输出 `event/data/空行`；
+- 真实 `/v1/diagnosis/stream` 路由返回 `text/event-stream`；
+- 验证 `status`、`final_answer` 和 `diagnosis_result` 事件顺序；
+- 验证最终诊断结果包含 `request_id`，并与响应头保持一致；
+- 验证 Agent 任务结束后发送内部结束标记，避免流生成器永久等待。
+
 ### Response 与业务连接测试
 
 - `DiagnosisReport` 包装为稳定成功响应；
@@ -245,11 +260,11 @@ Agent Loop 结束不等于业务结果合格。
 
 ## 当前限制
 
-当前仓库仍是非流式 Agent Runtime 实验服务，以下能力尚未接入完整链路：
+当前仓库已经完成 Mock Provider 驱动的非流式和 SSE Agent Runtime 实验链路，以下能力尚未接入完整链路：
 
 - FastAPI 诊断接口已完成第一版，仍需继续完善统一请求校验错误协议和生产级异常处理；
 - 响应层、Diagnosis Handler 和 HTTP 状态码映射已完成基础连接；
-- SSE 流式输出和客户端断开处理；
+- SSE 生产级错误事件协议、完整客户端断开回归测试和连接中断压力验证；
 - 真实模型 API 的完整 Function Calling 验证；
 - Token、TTFT、TPOT、延迟和成本统计；
 - 生产级持久化、鉴权、租户隔离和部署配置。
