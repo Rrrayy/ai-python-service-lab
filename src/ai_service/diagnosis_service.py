@@ -1,6 +1,10 @@
 from typing import Any
 
-from .agent_loop import build_model_request,run_agent
+from .agent_loop import (
+	AgentEventHandler,
+	build_model_request,
+	run_agent,
+)
 from .diagnosis import (
 	DiagnosisReport,
 	StructuredOutputError,
@@ -14,14 +18,16 @@ class DiagnosisProtocolError(Exception):
 	pass
 
 async def diagnose_issue(
-	provider:ModelProvider,
-	user_content:str,
-	max_model_calls:int=3,
+		provider:ModelProvider,
+		user_content:str,
+		max_model_calls:int=3,
+		on_event:AgentEventHandler|None=None,
 )->DiagnosisReport:
-	final_content,messages=await run_agent(
+	final_content, messages = await run_agent(
 		provider=provider,
 		user_content=user_content,
 		max_model_calls=max_model_calls,
+		on_event=on_event,
 	)
 
 	try:

@@ -1,5 +1,6 @@
 from typing import Any
 
+from .agent_loop import AgentEventHandler
 from .diagnosis_service import diagnose_issue
 from .providers import ModelProvider
 from .response import (
@@ -9,16 +10,18 @@ from .response import (
 
 
 async def handle_diagnosis(
-	provider:ModelProvider,
-	user_content:str,
-	request_id:str,
-	max_model_calls:int=3,
+		provider:ModelProvider,
+		user_content:str,
+		request_id:str,
+		max_model_calls:int=3,
+		on_event:AgentEventHandler|None=None,
 )->dict[str,Any]:
 	try:
-		report=await diagnose_issue(
+		report = await diagnose_issue(
 			provider=provider,
 			user_content=user_content,
 			max_model_calls=max_model_calls,
+			on_event=on_event,
 		)
 	except Exception as error:
 		return build_exception_response(

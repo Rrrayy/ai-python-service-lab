@@ -1,8 +1,28 @@
 import json
 
+from collections.abc import Awaitable,Callable
+from typing import Any
 from .providers import Message,ModelProvider,ModelRequest,ModelResponse,ToolCall
 from .tools import execute_tool_calls,tool_registry
 from collections import  Counter
+
+AgentEventHandler=Callable[
+	[dict[str,Any]],
+	Awaitable[None],
+]
+
+async def emit_event(
+	on_event:AgentEventHandler|None,
+	event_name:str,
+	data:dict[str,Any],
+)->None:
+	if on_event is None:
+		return
+
+	await on_event({
+		"event":event_name,
+		"data":data,
+	})
 
 class ScriptedProvider(ModelProvider):
 	def __init__(self)->None:
@@ -113,8 +133,9 @@ def serialize_message(message:dict)->dict:
 async def run_agent(
 		provider: ModelProvider,
 		user_content: str,
-		max_model_calls: int
-) -> tuple[str, list[dict]]:
+		max_model_calls: int,
+		on_event:AgentEventHandler|None=None,
+) -> tuple[str,list[dict]]:
 	messages = [
 		{
 			"role": "system",
@@ -126,7 +147,16 @@ async def run_agent(
 		}
 	]
 
-	for _ in range(max_model_calls):
+	for call_index in range(max_model_calls):
+		await emit_event(
+			on_event,
+			"status",
+			{
+				"stage": "model_calling",
+				"call_index": call_index + 1,
+			}
+		)
+
 		request = build_model_request(messages)
 		model_response = await provider.chat(request)
 		tool_calls = model_response.tool_calls
@@ -141,17 +171,47 @@ async def run_agent(
 		messages.append(assistant_message)
 
 		if tool_calls:
+			await emit_event(
+				on_event,
+				"tool_call_requested",
+				{
+					"tool_calls": [
+						tool_call.model_dump()
+						for tool_call in tool_calls
+					]
+				}
+			)
+
 			tool_results = await execute_tool_calls(
 				tool_calls,
 				tool_registry,
 				is_authenticated=True
 			)
+
 			validate_tool_results(tool_calls, tool_results)
 			messages.extend(tool_results)
+
+			await emit_event(
+				on_event,
+				"tool_completed",
+				{
+					"tool_results": tool_results
+				}
+			)
+
 			continue
 
 		content = model_response.content
+
 		if content:
+			await emit_event(
+				on_event,
+				"final_answer",
+				{
+					"content": content,
+				}
+			)
+
 			return content, messages
 
 		raise RuntimeError("模型既没有返回工具调用，也没有返回最终文本")
@@ -159,17 +219,34 @@ async def run_agent(
 	raise RuntimeError("超过最大模型调用次数")
 
 async def main() -> None:
+	async def on_event(event:dict[str,Any])->None:
+		print(
+			"事件：",
+			json.dumps(
+				event,
+				ensure_ascii=False
+			)
+		)
+
 	provider = ScriptedProvider()
-	final_content, messages = await run_agent(
+
+	final_content,messages = await run_agent(
 		provider,
 		"我目前完成了多少个 Agent 学习任务？",
-		max_model_calls=3
+		max_model_calls=3,
+		on_event=on_event
 	)
 
 	print(f"最终回答：{final_content}")
 	print("执行轨迹：")
+
 	for message in messages:
-		print(json.dumps(serialize_message(message),ensure_ascii=False))
+		print(
+			json.dumps(
+				serialize_message(message),
+				ensure_ascii=False
+			)
+		)
 
 if __name__ == "__main__":
 	import asyncio
